@@ -8,7 +8,7 @@ open_apps=(${(s:, :)open_apps})
 
 # Safe apps
 WARP="stable"
-safe_apps=("Finder" $WARP)
+safe_apps=("Finder" "Raycast" $WARP)
 # Close all apps that are not in the safe apps list
 
 for app in $open_apps; do
