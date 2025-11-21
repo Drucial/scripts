@@ -16,7 +16,7 @@ tab_name=$(basename "$selected")
 selected="$HOME/Dev/$selected"
 
 # Use kitty remote control to create new tab with nvim and split
-kitty @ launch --type=tab --cwd="$selected" --tab-title="$tab_name"
+kitty @ launch --type=tab --cwd="$selected" --tab-title="$tab_name" > /dev/null
 sleep 0.1
-kitty @ send-text --match recent:0 "nvim\n"
-kitty @ launch --location=vsplit --bias=30 --cwd="$selected"
+kitty @ send-text --match recent:0 "nvim\n" > /dev/null
+kitty @ launch --location=vsplit --bias=30 --cwd="$selected" > /dev/null
