@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# op - Open Project in Kitty with nvim
+# dev - Open Project in Kitty with nvim
+# Usage: dev [-s] — use -s for simple 70/30 layout
 
 # Find directories in ~/Dev and select with fzf
 selected=$(cd ~/Dev && ls -1 | fzf --prompt="Select project: " --preview-window=hidden)
@@ -15,8 +16,20 @@ tab_name=$(basename "$selected")
 # Build full path
 selected="$HOME/Dev/$selected"
 
-# Use kitty remote control to create new tab with nvim and split
+# Launch new tab with nvim
 kitty @ launch --type=tab --cwd="$selected" --tab-title="$tab_name" > /dev/null
 sleep 0.1
 kitty @ send-text --match recent:0 "nvim\n" > /dev/null
-kitty @ launch --location=vsplit --bias=30 --cwd="$selected" > /dev/null
+
+if [[ "$1" == "-s" ]]; then
+  # Simple: nvim | shell (70/30)
+  kitty @ launch --location=vsplit --bias=30 --cwd="$selected" > /dev/null
+else
+  # Default: nvim | claude / gg
+  kitty @ launch --location=vsplit --cwd="$selected" > /dev/null
+  sleep 0.1
+  kitty @ send-text --match recent:0 "claude\n" > /dev/null
+  kitty @ launch --location=hsplit --cwd="$selected" > /dev/null
+  sleep 0.1
+  kitty @ send-text --match recent:0 "gg\n" > /dev/null
+fi
