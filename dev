@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # dev — orchestrate a kitty tab with nvim + shell + Claude for a project.
 #
-# Auto-wires Claude (right pane) to nvim (left pane) via the IDE WebSocket.
-# Depends on coder/claudecode.nvim being eager-loaded (lazy = false) so the
-# IDE lockfile is written to ~/.claude/ide/ before `claude --ide` launches and
-# auto-discovers it. See drucial-dots/nvim/lua/plugins/claudecode.lua.
-#
-# Run `dev --help` for usage.
+# Full docs:        docs/dev.md (alongside this script)
+# Usage summary:    dev --help
+# Health check:     dev check
 
 # ── Configuration ──────────────────────────────────────────────────────────
 : "${DEV_CLAUDE_BIAS:=30}"
