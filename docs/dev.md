@@ -249,3 +249,40 @@ reload.
 - `~/.claude/ide/<port>.lock` — IDE handshake lockfile (managed by
   claudecode.nvim, pruned by `dev` on launch).
 - `~/.cache/dev/sessions.json` — session-state file (for `dev close`).
+
+## Future work
+
+### Replace `sessions.json` with kitty user-vars
+
+The current state file is a hint that can drift from reality (e.g. a
+session that gains extra splits, or one whose windows are manually
+closed) — the prune-on-`dev close` cycle papers over most cases but not
+all (see drift modes in the troubleshooting section).
+
+A more robust approach is to tag each pane with a kitty user-var at
+launch and let kitty be the source of truth. The plan of attack:
+
+1. **Pre-flight verify**: confirm `kitty @ set-user-vars --match id:N
+   key=value` works on the installed kitty and that the var appears in
+   `kitty @ ls`'s window JSON under `user_vars`.
+2. **Helpers**: small wrappers `_dev_mark_window`, `_dev_find_dev_tabs`
+   (tabs containing a window with `dev_role=nvim`), and
+   `_dev_window_by_role <tab_id> <role>`.
+3. **Tag at launch**: in `_dev_build_layout`, after each `kitty @ launch`
+   capturing a window id, set `dev_role` (nvim/claude/shell) on it and
+   `dev_project` / `dev_started` on the nvim window.
+4. **Rewrite `_dev_close`**: list dev tabs via `_dev_find_dev_tabs`,
+   fzf-pick (or `.` for current), resolve each pane's window id by
+   role, then send the existing close signals.
+5. **Delete**: `_dev_record_session`, `_dev_prune_sessions`,
+   `$DEV_SESSIONS_FILE`, and the corresponding troubleshooting/help text.
+6. **Migration**: on first run of the new version, if
+   `~/.cache/dev/sessions.json` exists, just `rm` it (it's stale by
+   definition — only tab-id values, no `dev_role` tags). Document in
+   the release note.
+
+Net effect: zero local state, kitty handles cleanup automatically when
+windows/tabs die, drift modes go away. Cost: ~50–80 lines net, plus
+edge-case thinking for `dev .` (which doesn't `kitty @ launch` for the
+nvim window — it sends `nvim\n` to the existing window, so tagging
+needs to happen against the captured `_dev_current_window_id`).
