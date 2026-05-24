@@ -103,7 +103,10 @@ _dev_lockfile_matches() {
   if command -v jq >/dev/null 2>&1; then
     jq -e --arg p "$path" '.workspaceFolders | index($p)' "$lock" >/dev/null 2>&1
   else
-    grep -F "\"$path\"" "$lock" >/dev/null 2>&1
+    # No-jq fallback. Anchor on the trailing JSON delimiter (`,` or `]`) so
+    # the project `foo` doesn't accidentally match a lockfile for `foobar`.
+    grep -F "\"$path\"," "$lock" >/dev/null 2>&1 \
+      || grep -F "\"$path\"]" "$lock" >/dev/null 2>&1
   fi
 }
 
@@ -152,17 +155,23 @@ _dev_record_session() {
 }
 
 # Drop sessions whose tab_id is no longer live in kitty. Echoes the count of
-# remaining live sessions.
+# remaining live sessions. If `kitty @ ls` fails (e.g. the socket is hung
+# after sleep/wake), leave the state file untouched rather than wiping it.
 _dev_prune_sessions() {
   [[ -f "$DEV_SESSIONS_FILE" ]] || { echo 0; return; }
   if ! command -v jq >/dev/null 2>&1; then
-    echo 0
+    jq 'length' "$DEV_SESSIONS_FILE" 2>/dev/null || echo 0
     return
   fi
   local live tmp
   live=$(kitty @ ls 2>/dev/null | jq -c '[.[] | .tabs[].id]')
+  if [[ -z "$live" || "$live" == "null" ]]; then
+    # Don't touch the file when we can't validate; treat it as untouched.
+    jq 'length' "$DEV_SESSIONS_FILE" 2>/dev/null || echo 0
+    return
+  fi
   tmp=$(mktemp)
-  jq --argjson live "${live:-[]}" \
+  jq --argjson live "$live" \
      'map(select((.tab_id | tonumber) as $t | $live | any(. == $t)))' \
      "$DEV_SESSIONS_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$DEV_SESSIONS_FILE" || rm -f "$tmp"
   jq 'length' "$DEV_SESSIONS_FILE" 2>/dev/null || echo 0
@@ -346,7 +355,7 @@ _dev_close() {
       echo "dev close .: couldn't identify the focused kitty tab." >&2
       return 1
     fi
-    if ! jq -e --arg t "$current_tab" 'any(.tab_id == $t)' "$DEV_SESSIONS_FILE" >/dev/null; then
+    if ! jq -e --arg t "$current_tab" 'any(.[]; .tab_id == $t)' "$DEV_SESSIONS_FILE" >/dev/null; then
       echo "dev close .: current tab is not a tracked dev session." >&2
       echo "     Use 'dev close' (no arg) to fzf-pick from active sessions." >&2
       return 1
