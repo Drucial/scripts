@@ -45,6 +45,111 @@ EXAMPLES
 EOF
 }
 
+# ── Prerequisites ──────────────────────────────────────────────────────────
+_dev_prereq() {
+  local missing=0
+  if ! command -v kitty >/dev/null 2>&1; then
+    echo "dev: 'kitty' not found in PATH" >&2
+    missing=1
+  fi
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "dev: 'claude' not found in PATH" >&2
+    missing=1
+  fi
+  if ! command -v fzf >/dev/null 2>&1; then
+    echo "dev: 'fzf' not found in PATH" >&2
+    missing=1
+  fi
+  if ! kitty @ ls >/dev/null 2>&1; then
+    echo "dev: kitty remote control not responding. In ~/.config/kitty/kitty.conf, set:" >&2
+    echo "       allow_remote_control yes" >&2
+    echo "       listen_on unix:/tmp/mykitty" >&2
+    echo "     then fully relaunch kitty (cmd-Q)." >&2
+    missing=1
+  fi
+  return $missing
+}
+
+# ── Lockfile helpers ───────────────────────────────────────────────────────
+# Prune lockfiles whose nvim process is no longer alive.
+_dev_prune_dead_lockfiles() {
+  local lock pid
+  shopt -s nullglob
+  for lock in "$HOME"/.claude/ide/*.lock; do
+    pid=""
+    if command -v jq >/dev/null 2>&1; then
+      pid=$(jq -r '.pid // empty' "$lock" 2>/dev/null)
+    else
+      # Fallback: pull "pid":N out of the JSON with sed
+      pid=$(sed -n 's/.*"pid":[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$lock" 2>/dev/null | head -1)
+    fi
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$lock"
+    fi
+  done
+  shopt -u nullglob
+}
+
+# Echo all current lockfile paths, one per line.
+_dev_lockfile_snapshot() {
+  shopt -s nullglob
+  local lock
+  for lock in "$HOME"/.claude/ide/*.lock; do
+    echo "$lock"
+  done
+  shopt -u nullglob
+}
+
+# Check whether a lockfile's workspaceFolders contains the given project path.
+_dev_lockfile_matches() {
+  local lock="$1" path="$2"
+  if command -v jq >/dev/null 2>&1; then
+    jq -e --arg p "$path" '.workspaceFolders | index($p)' "$lock" >/dev/null 2>&1
+  else
+    grep -F "\"$path\"" "$lock" >/dev/null 2>&1
+  fi
+}
+
+# Wait up to $DEV_LOCKFILE_TIMEOUT seconds for a NEW lockfile (i.e. not in
+# the $before snapshot) whose workspaceFolders matches $path. Echoes the
+# matched lockfile path on success; empty on timeout.
+_dev_wait_for_new_lockfile() {
+  local path="$1" before="$2"
+  local iterations=$((DEV_LOCKFILE_TIMEOUT * 10))
+  local i lock
+  shopt -s nullglob
+  for ((i = 0; i < iterations; i++)); do
+    for lock in "$HOME"/.claude/ide/*.lock; do
+      if grep -qFx "$lock" <<<"$before"; then
+        continue
+      fi
+      if _dev_lockfile_matches "$lock" "$path"; then
+        echo "$lock"
+        shopt -u nullglob
+        return 0
+      fi
+    done
+    sleep 0.1
+  done
+  shopt -u nullglob
+  return 1
+}
+
+# ── Session state ──────────────────────────────────────────────────────────
+_dev_record_session() {
+  local tab_id="$1" project="$2"
+  mkdir -p "$(dirname "$DEV_SESSIONS_FILE")"
+  if command -v jq >/dev/null 2>&1; then
+    local tmp
+    tmp=$(mktemp)
+    local existing="[]"
+    [[ -f "$DEV_SESSIONS_FILE" ]] && existing=$(cat "$DEV_SESSIONS_FILE")
+    jq --arg tab "$tab_id" --arg proj "$project" --arg ts "$(date -u +%FT%TZ)" \
+      '. + [{tab_id: $tab, project_path: $proj, started_at: $ts}]' \
+      <<<"$existing" >"$tmp" 2>/dev/null && mv "$tmp" "$DEV_SESSIONS_FILE" || rm -f "$tmp"
+  fi
+}
+
 # ── Subcommand stubs (to be implemented in later stages) ───────────────────
 _dev_local() {
   echo "dev .: not yet implemented (stage 5)" >&2
@@ -61,49 +166,78 @@ _dev_check() {
   return 1
 }
 
-# ── Default flow (will be hardened in stage 4) ─────────────────────────────
+# ── Default flow ───────────────────────────────────────────────────────────
 _dev_open() {
+  _dev_prereq || return 1
+
   # Find directories in ~/Dev and select with fzf
   local selected
   selected=$(cd ~/Dev && ls -1 | fzf --prompt="Select project: " --preview-window=hidden)
 
-  # Exit if nothing selected
   if [[ -z $selected ]]; then
     exit 0
   fi
 
-  # Get the directory name for the tab title
   local tab_name
   tab_name=$(basename "$selected")
-
-  # Build full path
   selected="$HOME/Dev/$selected"
 
-  # Launch new tab with nvim
-  kitty @ launch --type=tab --cwd="$selected" --tab-title="$tab_name" > /dev/null
-  sleep 0.1
-  kitty @ send-text --match recent:0 "nvim\n" > /dev/null
+  # Capture lockfile snapshot before launching nvim so we can identify *our*
+  # lockfile (not any other dev tab's) by diff. Prune dead lockfiles first.
+  mkdir -p "$HOME/.claude/ide"
+  _dev_prune_dead_lockfiles
+  local before
+  before=$(_dev_lockfile_snapshot)
+
+  # Launch tab + capture the new window's ID for deterministic targeting.
+  local nvim_win tab_id
+  nvim_win=$(kitty @ launch --type=tab --cwd="$selected" --tab-title="$tab_name")
+  # Tab id of the newly-launched window — for session state.
+  if command -v jq >/dev/null 2>&1; then
+    tab_id=$(kitty @ ls 2>/dev/null | jq -r --arg w "$nvim_win" \
+      '[.[].tabs[] | select(.windows[].id == ($w|tonumber)) | .id][0] // ""')
+  fi
+
+  sleep "$DEV_SHELL_READY_WAIT"
+  kitty @ send-text --match "id:$nvim_win" "nvim\n" > /dev/null
 
   if [[ "${1:-}" == "-s" ]]; then
-    # Simple: nvim | shell (70/30)
     kitty @ launch --location=vsplit --bias="$DEV_SHELL_BIAS" --cwd="$selected" > /dev/null
-  else
-    # Default: (nvim / shell) | claude
-    kitty @ launch --location=vsplit --bias="$DEV_CLAUDE_BIAS" --cwd="$selected" > /dev/null
-
-    # Wait for nvim's claudecode lockfile so Claude auto-discovers and connects.
-    local iterations=$((DEV_LOCKFILE_TIMEOUT * 10))
-    for ((i = 0; i < iterations; i++)); do
-      if grep -lF "\"$selected\"" "$HOME"/.claude/ide/*.lock 2>/dev/null | head -1 > /dev/null; then
-        break
-      fi
-      sleep 0.1
-    done
-
-    kitty @ send-text --match recent:0 "claude --ide\n" > /dev/null
-    kitty @ focus-window --match recent:1 > /dev/null
-    kitty @ launch --location=hsplit --bias="$DEV_SHELL_BIAS" --cwd="$selected" > /dev/null
+    [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$selected"
+    return 0
   fi
+
+  # Default: (nvim / shell) | claude
+  local claude_win
+  claude_win=$(kitty @ launch --location=vsplit --bias="$DEV_CLAUDE_BIAS" --cwd="$selected")
+
+  # Wait for *our* lockfile to appear (new since $before, matching $selected).
+  local matched_lock
+  matched_lock=$(_dev_wait_for_new_lockfile "$selected" "$before")
+
+  # Build the claude invocation. If we matched a lockfile, set the port env
+  # var explicitly (Claude has no --ide-port flag, but reads CLAUDE_CODE_SSE_PORT).
+  local claude_cmd="claude --ide"
+  if [[ -n "$matched_lock" ]]; then
+    local port
+    port=$(basename "$matched_lock" .lock)
+    if [[ "$port" =~ ^[0-9]+$ ]]; then
+      claude_cmd="CLAUDE_CODE_SSE_PORT=$port ENABLE_IDE_INTEGRATION=true claude --ide"
+    fi
+  else
+    echo "dev: nvim's IDE lockfile didn't appear within ${DEV_LOCKFILE_TIMEOUT}s." >&2
+    echo "     Falling back to 'claude --ide' (scans all lockfiles). If it picks the" >&2
+    echo "     wrong nvim, run /ide inside Claude and select the right one." >&2
+  fi
+
+  sleep "$DEV_SHELL_READY_WAIT"
+  kitty @ send-text --match "id:$claude_win" "$claude_cmd"$'\n' > /dev/null
+
+  # Focus nvim and add the shell pane below.
+  kitty @ focus-window --match "id:$nvim_win" > /dev/null
+  kitty @ launch --location=hsplit --bias="$DEV_SHELL_BIAS" --cwd="$selected" > /dev/null
+
+  [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$selected"
 }
 
 # ── Subcommand dispatch ────────────────────────────────────────────────────
