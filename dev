@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # dev - Open Project in Kitty with nvim
 # Usage: dev [-s] — use -s for simple 70/30 layout
+#
+# The default 3-pane mode auto-wires Claude (right pane) to nvim (left pane)
+# via the IDE WebSocket. Depends on coder/claudecode.nvim being eager-loaded
+# in nvim (lazy = false) so its lockfile is written to ~/.claude/ide/ before
+# `claude --ide` launches and auto-discovers it. See:
+#   drucial-dots/nvim/lua/plugins/claudecode.lua
 
 # Find directories in ~/Dev and select with fzf
 selected=$(cd ~/Dev && ls -1 | fzf --prompt="Select project: " --preview-window=hidden)
@@ -27,8 +33,17 @@ if [[ "$1" == "-s" ]]; then
 else
   # Default: (nvim / shell) | claude  — claude right ~30%, shell bottom-left ~30%
   kitty @ launch --location=vsplit --bias=30 --cwd="$selected" > /dev/null
-  sleep 0.1
-  kitty @ send-text --match recent:0 "claude\n" > /dev/null
+
+  # Wait up to 5s for nvim's claudecode lockfile (matching this project) so
+  # Claude auto-discovers and connects to the running editor on launch.
+  for _ in {1..50}; do
+    if grep -lF "\"$selected\"" "$HOME"/.claude/ide/*.lock 2>/dev/null | head -1 > /dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  kitty @ send-text --match recent:0 "claude --ide\n" > /dev/null
   kitty @ focus-window --match recent:1 > /dev/null
   kitty @ launch --location=hsplit --bias=30 --cwd="$selected" > /dev/null
 fi
