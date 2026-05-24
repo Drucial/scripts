@@ -263,6 +263,20 @@ _dev_local() {
     return 1
   fi
 
+  # The 3-pane layout assumes an empty tab. Refuse if the current tab already
+  # has splits — building on top would produce an unpredictable layout.
+  if command -v jq >/dev/null 2>&1; then
+    local window_count
+    window_count=$(kitty @ ls 2>/dev/null | jq -r \
+      '[.[] | .tabs[] | select(.is_focused) | (.windows | length)][0] // 0')
+    if [[ "${window_count:-0}" -gt 1 ]]; then
+      echo "dev .: refusing — the current kitty tab already has $window_count windows." >&2
+      echo "     dev . builds an opinionated 3-pane layout and assumes a single window." >&2
+      echo "     Open a fresh tab (cmd+t) and try again." >&2
+      return 1
+    fi
+  fi
+
   local nvim_win tab_id
   nvim_win=$(_dev_current_window_id)
   if [[ -z "$nvim_win" ]]; then
