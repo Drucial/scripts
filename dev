@@ -262,8 +262,8 @@ _dev_close() {
   # nvim first: :qa will fail if any buffer is modified, surfacing unsaved
   # work without losing it. If nvim is still running in its window after the
   # attempt, abort the rest of the soft-close so the user can resolve.
-  # (The window itself stays alive after nvim quits — it returns to the
-  # parent shell — so we check the foreground process, not window existence.)
+  # After nvim quits, the kitty window still holds the parent shell — send
+  # `exit` so the window closes too.
   if [[ -n "$nvim_w" ]]; then
     kitty @ send-text --match "id:$nvim_w" $'\e:qa\r' > /dev/null 2>&1
     sleep 0.5
@@ -278,11 +278,15 @@ _dev_close() {
       echo "     Save (:w) or force-quit (:qa!) inside the nvim pane, then re-run dev close." >&2
       return 1
     fi
+    kitty @ send-text --match "id:$nvim_w" $'exit\n' > /dev/null 2>&1
   fi
 
-  # Claude: Ctrl-D ends the session gracefully.
+  # Claude: `/exit` ends the session (Ctrl-D is a literal key in Claude's TUI,
+  # not EOF). Then `exit` closes the parent shell so the window goes away.
   if [[ -n "$claude_w" ]]; then
-    kitty @ send-text --match "id:$claude_w" $'\004' > /dev/null 2>&1
+    kitty @ send-text --match "id:$claude_w" $'/exit\r' > /dev/null 2>&1
+    sleep 1.0
+    kitty @ send-text --match "id:$claude_w" $'exit\n' > /dev/null 2>&1
   fi
   # Shell: graceful exit; tab closes when the last process exits.
   if [[ -n "$shell_w" ]]; then
