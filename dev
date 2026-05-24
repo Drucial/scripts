@@ -136,8 +136,10 @@ _dev_wait_for_new_lockfile() {
 }
 
 # ── Session state ──────────────────────────────────────────────────────────
+# Args: tab_id project nvim_win claude_win shell_win
+# Any of the window IDs may be empty (e.g. claude_win in simple mode).
 _dev_record_session() {
-  local tab_id="$1" project="$2"
+  local tab_id="$1" project="$2" nvim_w="$3" claude_w="$4" shell_w="$5"
   mkdir -p "$(dirname "$DEV_SESSIONS_FILE")"
   if command -v jq >/dev/null 2>&1; then
     local tmp
@@ -145,9 +147,28 @@ _dev_record_session() {
     local existing="[]"
     [[ -f "$DEV_SESSIONS_FILE" ]] && existing=$(cat "$DEV_SESSIONS_FILE")
     jq --arg tab "$tab_id" --arg proj "$project" --arg ts "$(date -u +%FT%TZ)" \
-      '. + [{tab_id: $tab, project_path: $proj, started_at: $ts}]' \
+       --arg nv "$nvim_w" --arg cl "$claude_w" --arg sh "$shell_w" \
+      '. + [{tab_id: $tab, project_path: $proj, started_at: $ts,
+             nvim_win: $nv, claude_win: $cl, shell_win: $sh}]' \
       <<<"$existing" >"$tmp" 2>/dev/null && mv "$tmp" "$DEV_SESSIONS_FILE" || rm -f "$tmp"
   fi
+}
+
+# Drop sessions whose tab_id is no longer live in kitty. Echoes the count of
+# remaining live sessions.
+_dev_prune_sessions() {
+  [[ -f "$DEV_SESSIONS_FILE" ]] || { echo 0; return; }
+  if ! command -v jq >/dev/null 2>&1; then
+    echo 0
+    return
+  fi
+  local live tmp
+  live=$(kitty @ ls 2>/dev/null | jq -c '[.[] | .tabs[].id]')
+  tmp=$(mktemp)
+  jq --argjson live "${live:-[]}" \
+     'map(select((.tab_id | tonumber) as $t | $live | any(. == $t)))' \
+     "$DEV_SESSIONS_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$DEV_SESSIONS_FILE" || rm -f "$tmp"
+  jq 'length' "$DEV_SESSIONS_FILE" 2>/dev/null || echo 0
 }
 
 # ── Kitty window/tab introspection ─────────────────────────────────────────
@@ -169,14 +190,105 @@ _dev_current_window_id() {
 }
 
 # ── Subcommand stubs (to be implemented in later stages) ───────────────────
-_dev_close() {
-  echo "dev close: not yet implemented (stage 6)" >&2
-  return 1
-}
-
 _dev_check() {
   echo "dev check: not yet implemented (stage 7)" >&2
   return 1
+}
+
+# ── Soft-close a session ───────────────────────────────────────────────────
+_dev_close() {
+  _dev_prereq || return 1
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "dev close: requires jq" >&2
+    return 1
+  fi
+
+  local target="${1:-}"
+  if [[ -n "$target" && "$target" != "." ]]; then
+    echo "dev close: unrecognized target '$target' (expected '.' or no argument)." >&2
+    return 1
+  fi
+
+  if [[ ! -f "$DEV_SESSIONS_FILE" ]]; then
+    echo "dev close: no recorded sessions ($DEV_SESSIONS_FILE doesn't exist)." >&2
+    return 1
+  fi
+
+  # Prune entries whose tab is no longer alive. Echoes the remaining count.
+  local remaining
+  remaining=$(_dev_prune_sessions)
+  if [[ "${remaining:-0}" -eq 0 ]]; then
+    echo "dev close: no live dev sessions tracked." >&2
+    return 1
+  fi
+
+  local target_tab=""
+
+  if [[ "$target" == "." ]]; then
+    local current_tab
+    current_tab=$(kitty @ ls 2>/dev/null | jq -r '[.[] | .tabs[] | select(.is_focused) | .id][0] // ""')
+    if [[ -z "$current_tab" ]]; then
+      echo "dev close .: couldn't identify the focused kitty tab." >&2
+      return 1
+    fi
+    if ! jq -e --arg t "$current_tab" 'any(.tab_id == $t)' "$DEV_SESSIONS_FILE" >/dev/null; then
+      echo "dev close .: current tab is not a tracked dev session." >&2
+      echo "     Use 'dev close' (no arg) to fzf-pick from active sessions." >&2
+      return 1
+    fi
+    target_tab="$current_tab"
+  else
+    local choice
+    choice=$(
+      jq -r --arg home "$HOME" \
+        '.[] | "\(.tab_id)\t\(.project_path | sub($home; "~"))\t\(.started_at)"' \
+        "$DEV_SESSIONS_FILE" \
+      | fzf --prompt="Close session: " --with-nth=2.. --delimiter=$'\t' --preview-window=hidden
+    )
+    if [[ -z "$choice" ]]; then
+      return 0
+    fi
+    target_tab=$(printf '%s' "$choice" | cut -f1)
+  fi
+
+  # Pull window IDs for this session.
+  local entry nvim_w claude_w shell_w project
+  entry=$(jq -r --arg t "$target_tab" '.[] | select(.tab_id == $t)' "$DEV_SESSIONS_FILE")
+  nvim_w=$(printf '%s' "$entry" | jq -r '.nvim_win // ""')
+  claude_w=$(printf '%s' "$entry" | jq -r '.claude_win // ""')
+  shell_w=$(printf '%s' "$entry" | jq -r '.shell_win // ""')
+  project=$(printf '%s' "$entry" | jq -r '.project_path // ""')
+
+  # nvim first: :qa will fail if any buffer is modified, surfacing unsaved
+  # work without losing it. If nvim's window is still alive after the attempt,
+  # abort the rest of the soft-close so the user can resolve.
+  if [[ -n "$nvim_w" ]]; then
+    kitty @ send-text --match "id:$nvim_w" $'\e:qa\r' > /dev/null 2>&1
+    sleep 0.5
+    if kitty @ ls 2>/dev/null \
+      | jq -e --arg w "$nvim_w" 'any(.[] | .tabs[].windows[]; (.id | tostring) == $w)' >/dev/null
+    then
+      echo "dev close: nvim has unsaved changes (or :qa was blocked) in '$project'." >&2
+      echo "     Save (:w) or force-quit (:qa!) inside the nvim pane, then re-run dev close." >&2
+      return 1
+    fi
+  fi
+
+  # Claude: Ctrl-D ends the session gracefully.
+  if [[ -n "$claude_w" ]]; then
+    kitty @ send-text --match "id:$claude_w" $'\004' > /dev/null 2>&1
+  fi
+  # Shell: graceful exit; tab closes when the last process exits.
+  if [[ -n "$shell_w" ]]; then
+    kitty @ send-text --match "id:$shell_w" $'exit\n' > /dev/null 2>&1
+  fi
+
+  # Drop this entry from the state file regardless of whether the windows
+  # finish exiting (we'll re-prune on next `dev close`).
+  local tmp
+  tmp=$(mktemp)
+  jq --arg t "$target_tab" 'map(select(.tab_id != $t))' "$DEV_SESSIONS_FILE" >"$tmp" \
+    && mv "$tmp" "$DEV_SESSIONS_FILE" || rm -f "$tmp"
 }
 
 # ── Layout builder ─────────────────────────────────────────────────────────
@@ -201,8 +313,9 @@ _dev_build_layout() {
   kitty @ send-text --match "id:$nvim_win" "nvim\n" > /dev/null
 
   if [[ "$mode" == "simple" ]]; then
-    kitty @ launch --location=vsplit --bias="$DEV_SHELL_BIAS" --cwd="$project" > /dev/null
-    [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$project"
+    local shell_win
+    shell_win=$(kitty @ launch --location=vsplit --bias="$DEV_SHELL_BIAS" --cwd="$project")
+    [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$project" "$nvim_win" "" "$shell_win"
     return 0
   fi
 
@@ -247,9 +360,10 @@ _dev_build_layout() {
   fi
 
   kitty @ focus-window --match "id:$nvim_win" > /dev/null
-  kitty @ launch --location=hsplit --bias="$DEV_SHELL_BIAS" --cwd="$project" > /dev/null
+  local shell_win
+  shell_win=$(kitty @ launch --location=hsplit --bias="$DEV_SHELL_BIAS" --cwd="$project")
 
-  [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$project"
+  [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$project" "$nvim_win" "$claude_win" "$shell_win"
 }
 
 # ── Local mode (`dev .`) ───────────────────────────────────────────────────
