@@ -25,11 +25,10 @@ if [[ "$1" == "-s" ]]; then
   # Simple: nvim | shell (70/30)
   kitty @ launch --location=vsplit --bias=30 --cwd="$selected" > /dev/null
 else
-  # Default: nvim | claude / gg
-  kitty @ launch --location=vsplit --cwd="$selected" > /dev/null
+  # Default: (nvim / shell) | claude  — claude right ~30%, shell bottom-left ~30%
+  kitty @ launch --location=vsplit --bias=30 --cwd="$selected" > /dev/null
   sleep 0.1
   kitty @ send-text --match recent:0 "claude\n" > /dev/null
-  kitty @ launch --location=hsplit --cwd="$selected" > /dev/null
-  sleep 0.1
-  kitty @ send-text --match recent:0 "gg\n" > /dev/null
+  kitty @ focus-window --match recent:1 > /dev/null
+  kitty @ launch --location=hsplit --bias=30 --cwd="$selected" > /dev/null
 fi
