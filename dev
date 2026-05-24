@@ -150,12 +150,25 @@ _dev_record_session() {
   fi
 }
 
-# ── Subcommand stubs (to be implemented in later stages) ───────────────────
-_dev_local() {
-  echo "dev .: not yet implemented (stage 5)" >&2
-  return 1
+# ── Kitty window/tab introspection ─────────────────────────────────────────
+# Echo the kitty tab id containing the given window id.
+_dev_tab_id_for_window() {
+  local win="$1"
+  if command -v jq >/dev/null 2>&1; then
+    kitty @ ls 2>/dev/null | jq -r --arg w "$win" \
+      '[.[].tabs[] | select(.windows[].id == ($w|tonumber)) | .id][0] // ""'
+  fi
 }
 
+# Echo the focused kitty window's id (across all os-windows).
+_dev_current_window_id() {
+  if command -v jq >/dev/null 2>&1; then
+    kitty @ ls 2>/dev/null | jq -r \
+      '[.[] | .tabs[] | select(.is_focused) | .windows[] | select(.is_focused) | .id][0] // ""'
+  fi
+}
+
+# ── Subcommand stubs (to be implemented in later stages) ───────────────────
 _dev_close() {
   echo "dev close: not yet implemented (stage 6)" >&2
   return 1
@@ -166,11 +179,107 @@ _dev_check() {
   return 1
 }
 
-# ── Default flow ───────────────────────────────────────────────────────────
+# ── Layout builder ─────────────────────────────────────────────────────────
+# Builds the 3-pane (or 2-pane simple) layout around a given nvim window.
+# Args:
+#   1: nvim window id (where `nvim` will be invoked)
+#   2: project path
+#   3: tab id (for session state; "" to skip)
+#   4: mode — "default" or "simple"
+#   5: defer_claude — 0 = wait for lockfile synchronously, 1 = wait in background
+#      (1 is needed for `dev .` because the shell can't start nvim until this
+#      script exits, so the lockfile can't appear in the foreground.)
+_dev_build_layout() {
+  local nvim_win="$1" project="$2" tab_id="$3" mode="$4" defer_claude="$5"
+
+  mkdir -p "$HOME/.claude/ide"
+  _dev_prune_dead_lockfiles
+  local before
+  before=$(_dev_lockfile_snapshot)
+
+  sleep "$DEV_SHELL_READY_WAIT"
+  kitty @ send-text --match "id:$nvim_win" "nvim\n" > /dev/null
+
+  if [[ "$mode" == "simple" ]]; then
+    kitty @ launch --location=vsplit --bias="$DEV_SHELL_BIAS" --cwd="$project" > /dev/null
+    [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$project"
+    return 0
+  fi
+
+  # Default: (nvim / shell) | claude
+  local claude_win
+  claude_win=$(kitty @ launch --location=vsplit --bias="$DEV_CLAUDE_BIAS" --cwd="$project")
+
+  if (( defer_claude )); then
+    # Background: wait for lockfile, then send claude command. Needed when this
+    # script's shell is also the one that will run nvim — we can't observe the
+    # lockfile in the foreground because nvim hasn't started yet.
+    (
+      local matched_lock port claude_cmd="claude --ide"
+      matched_lock=$(_dev_wait_for_new_lockfile "$project" "$before")
+      if [[ -n "$matched_lock" ]]; then
+        port=$(basename "$matched_lock" .lock)
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+          claude_cmd="CLAUDE_CODE_SSE_PORT=$port ENABLE_IDE_INTEGRATION=true claude --ide"
+        fi
+      fi
+      sleep "$DEV_SHELL_READY_WAIT"
+      kitty @ send-text --match "id:$claude_win" "$claude_cmd"$'\n' > /dev/null
+    ) </dev/null >/dev/null 2>&1 &
+    disown
+  else
+    local matched_lock
+    matched_lock=$(_dev_wait_for_new_lockfile "$project" "$before")
+    local claude_cmd="claude --ide"
+    if [[ -n "$matched_lock" ]]; then
+      local port
+      port=$(basename "$matched_lock" .lock)
+      if [[ "$port" =~ ^[0-9]+$ ]]; then
+        claude_cmd="CLAUDE_CODE_SSE_PORT=$port ENABLE_IDE_INTEGRATION=true claude --ide"
+      fi
+    else
+      echo "dev: nvim's IDE lockfile didn't appear within ${DEV_LOCKFILE_TIMEOUT}s." >&2
+      echo "     Falling back to 'claude --ide' (scans all lockfiles). If it picks" >&2
+      echo "     the wrong nvim, run /ide inside Claude and select the right one." >&2
+    fi
+    sleep "$DEV_SHELL_READY_WAIT"
+    kitty @ send-text --match "id:$claude_win" "$claude_cmd"$'\n' > /dev/null
+  fi
+
+  kitty @ focus-window --match "id:$nvim_win" > /dev/null
+  kitty @ launch --location=hsplit --bias="$DEV_SHELL_BIAS" --cwd="$project" > /dev/null
+
+  [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$project"
+}
+
+# ── Local mode (`dev .`) ───────────────────────────────────────────────────
+_dev_local() {
+  _dev_prereq || return 1
+
+  local project="$PWD"
+  if [[ "${DEV_ANY_CWD:-0}" != "1" && "$project" != "$HOME/Dev/"* ]]; then
+    echo "dev .: refusing to build a session here — cwd is not under ~/Dev." >&2
+    echo "     If this is intentional, re-run with DEV_ANY_CWD=1 dev ." >&2
+    return 1
+  fi
+
+  local nvim_win tab_id
+  nvim_win=$(_dev_current_window_id)
+  if [[ -z "$nvim_win" ]]; then
+    echo "dev .: couldn't identify the focused kitty window. Is jq installed?" >&2
+    return 1
+  fi
+  tab_id=$(_dev_tab_id_for_window "$nvim_win")
+
+  # Background-deferred claude wait: the current shell is running this script
+  # and can't start nvim until we exit, so the lockfile won't appear in time.
+  _dev_build_layout "$nvim_win" "$project" "$tab_id" "default" 1
+}
+
+# ── Default flow (`dev`, `dev -s`) ─────────────────────────────────────────
 _dev_open() {
   _dev_prereq || return 1
 
-  # Find directories in ~/Dev and select with fzf
   local selected
   selected=$(cd ~/Dev && ls -1 | fzf --prompt="Select project: " --preview-window=hidden)
 
@@ -182,62 +291,16 @@ _dev_open() {
   tab_name=$(basename "$selected")
   selected="$HOME/Dev/$selected"
 
-  # Capture lockfile snapshot before launching nvim so we can identify *our*
-  # lockfile (not any other dev tab's) by diff. Prune dead lockfiles first.
-  mkdir -p "$HOME/.claude/ide"
-  _dev_prune_dead_lockfiles
-  local before
-  before=$(_dev_lockfile_snapshot)
-
-  # Launch tab + capture the new window's ID for deterministic targeting.
   local nvim_win tab_id
   nvim_win=$(kitty @ launch --type=tab --cwd="$selected" --tab-title="$tab_name")
-  # Tab id of the newly-launched window — for session state.
-  if command -v jq >/dev/null 2>&1; then
-    tab_id=$(kitty @ ls 2>/dev/null | jq -r --arg w "$nvim_win" \
-      '[.[].tabs[] | select(.windows[].id == ($w|tonumber)) | .id][0] // ""')
-  fi
+  tab_id=$(_dev_tab_id_for_window "$nvim_win")
 
-  sleep "$DEV_SHELL_READY_WAIT"
-  kitty @ send-text --match "id:$nvim_win" "nvim\n" > /dev/null
+  local mode="default"
+  [[ "${1:-}" == "-s" ]] && mode="simple"
 
-  if [[ "${1:-}" == "-s" ]]; then
-    kitty @ launch --location=vsplit --bias="$DEV_SHELL_BIAS" --cwd="$selected" > /dev/null
-    [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$selected"
-    return 0
-  fi
-
-  # Default: (nvim / shell) | claude
-  local claude_win
-  claude_win=$(kitty @ launch --location=vsplit --bias="$DEV_CLAUDE_BIAS" --cwd="$selected")
-
-  # Wait for *our* lockfile to appear (new since $before, matching $selected).
-  local matched_lock
-  matched_lock=$(_dev_wait_for_new_lockfile "$selected" "$before")
-
-  # Build the claude invocation. If we matched a lockfile, set the port env
-  # var explicitly (Claude has no --ide-port flag, but reads CLAUDE_CODE_SSE_PORT).
-  local claude_cmd="claude --ide"
-  if [[ -n "$matched_lock" ]]; then
-    local port
-    port=$(basename "$matched_lock" .lock)
-    if [[ "$port" =~ ^[0-9]+$ ]]; then
-      claude_cmd="CLAUDE_CODE_SSE_PORT=$port ENABLE_IDE_INTEGRATION=true claude --ide"
-    fi
-  else
-    echo "dev: nvim's IDE lockfile didn't appear within ${DEV_LOCKFILE_TIMEOUT}s." >&2
-    echo "     Falling back to 'claude --ide' (scans all lockfiles). If it picks the" >&2
-    echo "     wrong nvim, run /ide inside Claude and select the right one." >&2
-  fi
-
-  sleep "$DEV_SHELL_READY_WAIT"
-  kitty @ send-text --match "id:$claude_win" "$claude_cmd"$'\n' > /dev/null
-
-  # Focus nvim and add the shell pane below.
-  kitty @ focus-window --match "id:$nvim_win" > /dev/null
-  kitty @ launch --location=hsplit --bias="$DEV_SHELL_BIAS" --cwd="$selected" > /dev/null
-
-  [[ -n "$tab_id" ]] && _dev_record_session "$tab_id" "$selected"
+  # Foreground claude wait: nvim runs in the freshly-launched shell, so the
+  # lockfile appears while this script is still running.
+  _dev_build_layout "$nvim_win" "$selected" "$tab_id" "$mode" 0
 }
 
 # ── Subcommand dispatch ────────────────────────────────────────────────────
