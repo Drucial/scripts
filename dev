@@ -1,49 +1,140 @@
 #!/usr/bin/env bash
-# dev - Open Project in Kitty with nvim
-# Usage: dev [-s] — use -s for simple 70/30 layout
+# dev — orchestrate a kitty tab with nvim + shell + Claude for a project.
 #
-# The default 3-pane mode auto-wires Claude (right pane) to nvim (left pane)
-# via the IDE WebSocket. Depends on coder/claudecode.nvim being eager-loaded
-# in nvim (lazy = false) so its lockfile is written to ~/.claude/ide/ before
-# `claude --ide` launches and auto-discovers it. See:
-#   drucial-dots/nvim/lua/plugins/claudecode.lua
+# Auto-wires Claude (right pane) to nvim (left pane) via the IDE WebSocket.
+# Depends on coder/claudecode.nvim being eager-loaded (lazy = false) so the
+# IDE lockfile is written to ~/.claude/ide/ before `claude --ide` launches and
+# auto-discovers it. See drucial-dots/nvim/lua/plugins/claudecode.lua.
+#
+# Run `dev --help` for usage.
 
-# Find directories in ~/Dev and select with fzf
-selected=$(cd ~/Dev && ls -1 | fzf --prompt="Select project: " --preview-window=hidden)
+# ── Configuration ──────────────────────────────────────────────────────────
+: "${DEV_CLAUDE_BIAS:=30}"
+: "${DEV_SHELL_BIAS:=30}"
+: "${DEV_LOCKFILE_TIMEOUT:=5}"      # seconds
+: "${DEV_SHELL_READY_WAIT:=0.3}"    # seconds; gives slow shells time to prompt
+: "${DEV_SESSIONS_FILE:=$HOME/.cache/dev/sessions.json}"
 
-# Exit if nothing selected
-if [[ -z $selected ]]; then
-  exit 0
-fi
+# ── Help ───────────────────────────────────────────────────────────────────
+_dev_help() {
+  cat <<'EOF'
+dev — orchestrate a kitty tab with nvim + shell + Claude for a project.
 
-# Get the directory name for the tab title
-tab_name=$(basename "$selected")
+USAGE
+  dev                       open default 3-pane (nvim / shell | claude)
+  dev -s                    open simple 2-pane (nvim | shell), no claude
+  dev .                     build the layout in the CURRENT kitty tab/cwd
+  dev close [target]        close a dev session (target: omit = fzf-pick, '.' = current tab)
+  dev check                 health-check the workflow prerequisites and live flow
+  dev --help, dev -h        show this help
 
-# Build full path
-selected="$HOME/Dev/$selected"
+ENVIRONMENT
+  DEV_CLAUDE_BIAS          claude pane width % (default 30)
+  DEV_SHELL_BIAS           shell pane size %   (default 30)
+  DEV_LOCKFILE_TIMEOUT     seconds to wait for nvim's IDE lockfile (default 5)
+  DEV_SHELL_READY_WAIT     seconds to wait for a new shell to be ready (default 0.3)
+  DEV_SESSIONS_FILE        session-state file (default ~/.cache/dev/sessions.json)
+  DEV_ANY_CWD=1            allow `dev .` from cwds outside ~/Dev
 
-# Launch new tab with nvim
-kitty @ launch --type=tab --cwd="$selected" --tab-title="$tab_name" > /dev/null
-sleep 0.1
-kitty @ send-text --match recent:0 "nvim\n" > /dev/null
+EXAMPLES
+  dev                       fzf-pick a project under ~/Dev, open the layout
+  DEV_CLAUDE_BIAS=40 dev    same, but give Claude 40% of the tab
+  cd ~/Dev/foo && dev .     convert the current tab into the layout
+  dev close                 fzf-pick a running session and soft-close it
+  dev close .               soft-close the current tab (if it's a dev session)
+EOF
+}
 
-if [[ "$1" == "-s" ]]; then
-  # Simple: nvim | shell (70/30)
-  kitty @ launch --location=vsplit --bias=30 --cwd="$selected" > /dev/null
-else
-  # Default: (nvim / shell) | claude  — claude right ~30%, shell bottom-left ~30%
-  kitty @ launch --location=vsplit --bias=30 --cwd="$selected" > /dev/null
+# ── Subcommand stubs (to be implemented in later stages) ───────────────────
+_dev_local() {
+  echo "dev .: not yet implemented (stage 5)" >&2
+  return 1
+}
 
-  # Wait up to 5s for nvim's claudecode lockfile (matching this project) so
-  # Claude auto-discovers and connects to the running editor on launch.
-  for _ in {1..50}; do
-    if grep -lF "\"$selected\"" "$HOME"/.claude/ide/*.lock 2>/dev/null | head -1 > /dev/null; then
-      break
-    fi
-    sleep 0.1
-  done
+_dev_close() {
+  echo "dev close: not yet implemented (stage 6)" >&2
+  return 1
+}
 
-  kitty @ send-text --match recent:0 "claude --ide\n" > /dev/null
-  kitty @ focus-window --match recent:1 > /dev/null
-  kitty @ launch --location=hsplit --bias=30 --cwd="$selected" > /dev/null
-fi
+_dev_check() {
+  echo "dev check: not yet implemented (stage 7)" >&2
+  return 1
+}
+
+# ── Default flow (will be hardened in stage 4) ─────────────────────────────
+_dev_open() {
+  # Find directories in ~/Dev and select with fzf
+  local selected
+  selected=$(cd ~/Dev && ls -1 | fzf --prompt="Select project: " --preview-window=hidden)
+
+  # Exit if nothing selected
+  if [[ -z $selected ]]; then
+    exit 0
+  fi
+
+  # Get the directory name for the tab title
+  local tab_name
+  tab_name=$(basename "$selected")
+
+  # Build full path
+  selected="$HOME/Dev/$selected"
+
+  # Launch new tab with nvim
+  kitty @ launch --type=tab --cwd="$selected" --tab-title="$tab_name" > /dev/null
+  sleep 0.1
+  kitty @ send-text --match recent:0 "nvim\n" > /dev/null
+
+  if [[ "${1:-}" == "-s" ]]; then
+    # Simple: nvim | shell (70/30)
+    kitty @ launch --location=vsplit --bias="$DEV_SHELL_BIAS" --cwd="$selected" > /dev/null
+  else
+    # Default: (nvim / shell) | claude
+    kitty @ launch --location=vsplit --bias="$DEV_CLAUDE_BIAS" --cwd="$selected" > /dev/null
+
+    # Wait for nvim's claudecode lockfile so Claude auto-discovers and connects.
+    local iterations=$((DEV_LOCKFILE_TIMEOUT * 10))
+    for ((i = 0; i < iterations; i++)); do
+      if grep -lF "\"$selected\"" "$HOME"/.claude/ide/*.lock 2>/dev/null | head -1 > /dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+
+    kitty @ send-text --match recent:0 "claude --ide\n" > /dev/null
+    kitty @ focus-window --match recent:1 > /dev/null
+    kitty @ launch --location=hsplit --bias="$DEV_SHELL_BIAS" --cwd="$selected" > /dev/null
+  fi
+}
+
+# ── Subcommand dispatch ────────────────────────────────────────────────────
+case "${1:-}" in
+  -h|--help)
+    _dev_help
+    exit 0
+    ;;
+  check)
+    shift
+    _dev_check "$@"
+    exit $?
+    ;;
+  close)
+    shift
+    _dev_close "$@"
+    exit $?
+    ;;
+  .)
+    shift
+    _dev_local "$@"
+    exit $?
+    ;;
+  ""|-s)
+    _dev_open "$@"
+    exit $?
+    ;;
+  *)
+    echo "dev: unknown subcommand: $1" >&2
+    echo >&2
+    _dev_help >&2
+    exit 1
+    ;;
+esac
