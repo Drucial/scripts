@@ -138,6 +138,150 @@ dev close
 | `DEV_SESSIONS_FILE`     | `~/.cache/dev/sessions.json`         | Session-state file for `dev close`                               |
 | `DEV_ANY_CWD`           | unset                                | `1` allows `dev .` from cwds outside `~/Dev/`                    |
 
+## Manual testing checklist
+
+Run through this after a fresh clone, a major version bump of any
+component (kitty, claude, nvim, claudecode.nvim), or before relying on
+a new machine setup. Items are grouped by feature; each step is one
+line of action + one line of expected result.
+
+### Help & dispatch
+
+- [ ] `dev --help` and `dev -h` → prints usage; exit 0.
+- [ ] `dev bogus` → prints "unknown subcommand", followed by help; exit 1.
+
+### Default flow
+
+- [ ] `dev` → fzf-pick a project under `~/Dev/`; new kitty tab opens
+      with nvim (top-left, ~70% width), shell (bottom-left, ~30% height),
+      claude (right pane, ~30% width).
+- [ ] In Claude, `/ide` → reports "Neovim" connected with the right
+      workspace. ✓ if path matches the picked project exactly.
+- [ ] In nvim, statusline shows `● Claude` (in iris) right after the
+      filename.
+- [ ] `cat ~/.cache/dev/sessions.json | jq .` → one new entry with
+      `tab_id`, `project_path` (full path), `started_at` (UTC ISO),
+      `nvim_win`, `claude_win`, `shell_win` (all non-empty numeric strings).
+- [ ] Ask Claude to edit a file → diff opens in the nvim tab. Accept
+      from Claude pane → diff tab closes; if the file was already open
+      in the underlying buffer, it reloads automatically within ~100ms.
+
+### Simple flow
+
+- [ ] `dev -s` → fzf-pick a project; new tab with nvim (left, ~70%) and
+      shell (right, ~30%). No claude pane.
+- [ ] `cat ~/.cache/dev/sessions.json | jq '.[-1]'` → entry has empty
+      `claude_win`, populated `shell_win`.
+
+### Local mode (`dev .`)
+
+- [ ] In a *fresh* kitty tab (no splits), `cd ~/Dev/some-project && dev .`
+      → current shell becomes nvim; claude and shell panes appear as
+      vsplit/hsplit. Claude auto-connects.
+- [ ] In a tab with existing splits, `dev .` → refuses with "current
+      kitty tab already has N windows" message; exit 1.
+- [ ] In a fresh tab, `cd ~ && dev .` → refuses with "cwd is not under
+      `~/Dev`" message; exit 1.
+- [ ] `cd ~ && DEV_ANY_CWD=1 dev .` → succeeds (escape hatch works).
+
+### Close — fzf form
+
+- [ ] Open two `dev` sessions on different projects. `dev close` from
+      a separate (non-dev) tab → fzf lists both with their project
+      paths (`~/`-shortened) and timestamps. Picking one closes its
+      tab cleanly: nvim quits, claude `/exit`s, shells exit, tab gone.
+- [ ] After the close, `cat ~/.cache/dev/sessions.json | jq length` →
+      exactly one entry remains; the closed one is gone.
+
+### Close — current tab (`dev close .`)
+
+- [ ] From inside a dev tab's shell pane, `dev close .` → closes that
+      tab (same teardown sequence as above).
+- [ ] From a non-dev kitty tab, `dev close .` → refuses with "current
+      tab is not a tracked dev session"; exit 1.
+
+### Close — unsaved changes guard
+
+- [ ] In a dev session, make an edit in nvim and do NOT save. Run
+      `dev close .` from the shell pane → script reports "nvim has
+      unsaved changes (or :qa was blocked)"; exits 1 *before* touching
+      the claude or shell panes. State file entry remains.
+- [ ] Save the buffer (`:w`) then `dev close .` again → closes cleanly.
+
+### Health check
+
+- [ ] `dev check` from a working setup → all PASS rows; "N PASS, 0
+      WARN, 0 FAIL"; exit 0.
+- [ ] `PATH="/usr/bin:/bin" dev check` (or similar) → reports specific
+      missing-binary FAILs; live simulation is SKIPPED; "N PASS, N
+      WARN, M FAIL"; exit 1.
+- [ ] Temporarily comment out `allow_remote_control yes` in
+      `~/.config/kitty/kitty.conf` and quit/relaunch kitty → `dev check`
+      reports the kitty-remote-control FAIL specifically; exit 1.
+      Restore and relaunch kitty when done.
+
+### lualine indicator
+
+- [ ] With no Claude session running anywhere, open nvim → statusline
+      has no `● Claude` segment.
+- [ ] In a dev tab, with Claude connected, the indicator is visible.
+- [ ] `/exit` Claude (only) inside the dev tab → indicator disappears
+      within lualine's next refresh tick.
+
+### fs watcher
+
+- [ ] In a dev tab, ask Claude to edit a file you have open in nvim.
+      Accept the diff from Claude. Buffer in nvim reloads to the new
+      content *without* you switching panes.
+- [ ] In the shell pane of a dev tab, `git checkout some-other-branch`
+      → buffers reload to the other branch's content automatically
+      (unsaved buffers show the W11 warning instead of silent reload).
+- [ ] Create `~/Dev/<project>/node_modules-backup/probe.txt` from an
+      external shell, modify it → fs watcher fires; `:messages` in
+      nvim shows no errors. (Anchored ignore — `node_modules-backup`
+      should NOT be ignored even though `node_modules` is.)
+- [ ] Modify `~/Dev/<project>/node_modules/foo/probe.txt` externally
+      → fs watcher does NOT fire `:checktime`. (Confirm by adding a
+      `print('checktime')` line temporarily in `autocmds.lua` if you
+      want hard evidence.)
+
+### Multi-tab same project
+
+- [ ] Open `dev myproject` twice in quick succession → two kitty tabs,
+      two lockfiles in `~/.claude/ide/`, two sessions in the state file.
+- [ ] In tab-2's Claude, edit a file → diff lands in tab-2's nvim,
+      *not* tab-1's. (This is the snapshot-diff bug-fix from Stage 4
+      and the multi-tab promise of the workflow.)
+
+### Worktrees
+
+- [ ] Create a worktree alongside: `git worktree add ~/Dev/myproject.feat
+      feature-branch`. `dev` lists both `myproject` and `myproject.feat`
+      in fzf. Opening each gives independent nvim/Claude sessions with
+      their respective `workspaceFolders`.
+
+### Stale-lockfile cleanup
+
+- [ ] Force-kill an nvim from a dev session (`kill -9 <pid>` of its
+      nvim process). The lockfile is left behind in `~/.claude/ide/`.
+      Run `dev myproject` for the same project → the snapshot-diff +
+      stale-prune step removes the orphan lockfile and matches the new
+      one; Claude auto-connects to the *new* nvim.
+
+### Manual tab modification (drift)
+
+- [ ] Open a dev session. Add an extra split to the tab manually
+      (e.g. `kitty @ launch --location=hsplit`). `dev close .` →
+      closes the three tracked panes correctly; the extra split is
+      left running and keeps the tab alive (sub-optimal but expected).
+
+### kitty socket recovery
+
+- [ ] After macOS sleep/wake, if `kitty @ ls` hangs or errors → fully
+      quit kitty (cmd-Q) and relaunch. Existing dev tabs come back as
+      regular kitty windows; their nvims have lost the WebSocket
+      server. The state file is left untouched (no destructive wipe).
+
 ## Troubleshooting
 
 ### Claude pane shows "None" in `/ide`
