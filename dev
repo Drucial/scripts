@@ -189,10 +189,128 @@ _dev_current_window_id() {
   fi
 }
 
-# ── Subcommand stubs (to be implemented in later stages) ───────────────────
+# ── Health check ───────────────────────────────────────────────────────────
 _dev_check() {
-  echo "dev check: not yet implemented (stage 7)" >&2
-  return 1
+  local pass=0 warn=0 fail=0
+  local green="" yellow="" red="" reset=""
+  if [[ -t 1 ]]; then
+    green=$'\033[32m'; yellow=$'\033[33m'; red=$'\033[31m'; reset=$'\033[0m'
+  fi
+
+  _row() {
+    case "$1" in
+      PASS) printf "  %sPASS%s  %s\n" "$green" "$reset" "$2"; pass=$((pass+1)) ;;
+      WARN) printf "  %sWARN%s  %s\n" "$yellow" "$reset" "$2"; warn=$((warn+1)) ;;
+      FAIL) printf "  %sFAIL%s  %s\n" "$red" "$reset" "$2"; fail=$((fail+1)) ;;
+    esac
+  }
+
+  echo "dev check — prerequisites"
+
+  # Required binaries
+  command -v kitty >/dev/null 2>&1 \
+    && _row PASS "kitty in PATH" \
+    || _row FAIL "kitty not in PATH"
+
+  if command -v claude >/dev/null 2>&1; then
+    local cv
+    cv=$(claude --version 2>/dev/null | head -1)
+    _row PASS "claude in PATH${cv:+ — $cv}"
+  else
+    _row FAIL "claude not in PATH"
+  fi
+
+  if command -v nvim >/dev/null 2>&1; then
+    local nv
+    nv=$(nvim --version 2>/dev/null | head -1)
+    _row PASS "nvim in PATH${nv:+ — $nv}"
+  else
+    _row FAIL "nvim not in PATH"
+  fi
+
+  command -v fzf >/dev/null 2>&1 \
+    && _row PASS "fzf in PATH" \
+    || _row FAIL "fzf not in PATH"
+
+  if command -v jq >/dev/null 2>&1; then
+    _row PASS "jq in PATH"
+  else
+    _row WARN "jq not in PATH (lockfile match falls back to grep; dev close requires jq)"
+  fi
+
+  # Runtime checks
+  if kitty @ ls >/dev/null 2>&1; then
+    _row PASS "kitty remote control responding"
+  else
+    _row FAIL "kitty @ ls failed — set 'allow_remote_control yes' + 'listen_on …' in kitty.conf and relaunch kitty"
+  fi
+
+  mkdir -p "$HOME/.claude/ide" 2>/dev/null
+  if [[ -w "$HOME/.claude/ide" ]]; then
+    _row PASS "~/.claude/ide/ writable"
+  else
+    _row FAIL "~/.claude/ide/ not writable"
+  fi
+
+  echo
+  echo "dev check — live flow simulation"
+
+  if (( fail > 0 )); then
+    _row WARN "skipping (prerequisites failed)"
+  else
+    # Spawn a headless nvim in a temp cwd; claudecode.nvim (if eager-loaded)
+    # writes a lockfile shortly after VeryLazy. We snapshot beforehand and
+    # confirm a new matching lockfile appears within the timeout.
+    local tmpdir before found="" pid
+    tmpdir=$(mktemp -d)
+    # Resolve symlinks (macOS /var -> /private/var); claudecode records the
+    # real path in workspaceFolders, so we must compare against that.
+    tmpdir=$(cd "$tmpdir" && pwd -P)
+    before=$(_dev_lockfile_snapshot)
+
+    (
+      cd "$tmpdir"
+      nvim --headless \
+        -c "autocmd User VeryLazy ++once lua vim.defer_fn(function() vim.cmd.qa() end, 1500)" \
+        >/dev/null 2>&1
+    ) &
+    pid=$!
+
+    local i iterations=$((DEV_LOCKFILE_TIMEOUT * 10))
+    shopt -s nullglob
+    for ((i = 0; i < iterations; i++)); do
+      for lock in "$HOME"/.claude/ide/*.lock; do
+        if grep -qFx "$lock" <<<"$before"; then
+          continue
+        fi
+        if _dev_lockfile_matches "$lock" "$tmpdir"; then
+          found="$lock"
+          break 2
+        fi
+      done
+      sleep 0.1
+    done
+    shopt -u nullglob
+
+    if [[ -n "$found" ]]; then
+      local port
+      port=$(basename "$found" .lock)
+      _row PASS "headless nvim wrote IDE lockfile (port=$port)"
+    else
+      _row FAIL "headless nvim didn't write IDE lockfile within ${DEV_LOCKFILE_TIMEOUT}s — is claudecode.nvim eager-loaded?"
+    fi
+
+    wait "$pid" 2>/dev/null
+    rm -rf "$tmpdir"
+  fi
+
+  echo
+  if (( fail > 0 )); then
+    printf "%d PASS, %d WARN, %s%d FAIL%s\n" "$pass" "$warn" "$red" "$fail" "$reset"
+    return 1
+  fi
+  printf "%d PASS, %d WARN, 0 FAIL\n" "$pass" "$warn"
+  return 0
 }
 
 # ── Soft-close a session ───────────────────────────────────────────────────
