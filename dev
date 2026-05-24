@@ -260,13 +260,19 @@ _dev_close() {
   project=$(printf '%s' "$entry" | jq -r '.project_path // ""')
 
   # nvim first: :qa will fail if any buffer is modified, surfacing unsaved
-  # work without losing it. If nvim's window is still alive after the attempt,
-  # abort the rest of the soft-close so the user can resolve.
+  # work without losing it. If nvim is still running in its window after the
+  # attempt, abort the rest of the soft-close so the user can resolve.
+  # (The window itself stays alive after nvim quits — it returns to the
+  # parent shell — so we check the foreground process, not window existence.)
   if [[ -n "$nvim_w" ]]; then
     kitty @ send-text --match "id:$nvim_w" $'\e:qa\r' > /dev/null 2>&1
     sleep 0.5
     if kitty @ ls 2>/dev/null \
-      | jq -e --arg w "$nvim_w" 'any(.[] | .tabs[].windows[]; (.id | tostring) == $w)' >/dev/null
+      | jq -e --arg w "$nvim_w" '
+          [.[] | .tabs[].windows[] | select((.id | tostring) == $w)
+                                   | .foreground_processes[].cmdline[0]
+                                   | select(contains("nvim"))] | length > 0
+        ' >/dev/null
     then
       echo "dev close: nvim has unsaved changes (or :qa was blocked) in '$project'." >&2
       echo "     Save (:w) or force-quit (:qa!) inside the nvim pane, then re-run dev close." >&2
